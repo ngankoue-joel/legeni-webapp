@@ -1,10 +1,12 @@
-// Pipeline de référence du TP 3.5 : tests -> build -> test d'acceptance -> push
+
 pipeline {
     agent any
 
     parameters {
-        string(name: 'DOCKERHUB_ID', defaultValue: 'legeni07', description: 'Votre identifiant Docker Hub')
-        booleanParam(name: 'PUSH', defaultValue: true, description: "Pousser l'image sur Docker Hub")
+        string(name: 'DOCKERHUB_ID', defaultValue: 'legeni07',
+               description: 'Votre identifiant Docker Hub')
+        booleanParam(name: 'PUSH', defaultValue: true,
+                     description: 'Pousser et déployer l’image')
     }
 
     environment {
@@ -16,14 +18,13 @@ pipeline {
 
     options {
         timestamps()
-        timeout(time: 20, unit: 'MINUTES')
+        timeout(time: 30, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '10'))
     }
 
     stages {
         stage('Tests unitaires') {
             steps {
-                // L'étape "test" du Dockerfile lance flake8 + pytest : si un test échoue, le build s'arrête ici
                 sh 'docker build --target test -t legeni-webapp:test .'
             }
         }
@@ -39,9 +40,11 @@ pipeline {
                 sh '''
                     docker network create $CI_NETWORK
                     docker run -d --name $TEST_CONTAINER --network $CI_NETWORK $IMAGE:$VERSION
-                    # On interroge le conteneur depuis un conteneur curl placé sur le même réseau
+
                     docker run --rm --network $CI_NETWORK curlimages/curl:8.11.1 \
-                        -sf --retry 10 --retry-connrefused --retry-delay 1 http://$TEST_CONTAINER:5000/health
+                        -sf --retry 10 --retry-connrefused --retry-delay 1 \
+                        http://$TEST_CONTAINER:5000/health
+
                     docker run --rm --network $CI_NETWORK curlimages/curl:8.11.1 \
                         -sf http://$TEST_CONTAINER:5000/ | grep -q "Version $VERSION"
                 '''
@@ -49,30 +52,73 @@ pipeline {
         }
 
         stage('Push Docker Hub') {
-            when { expression { params.PUSH } }
+            when {
+                expression { params.PUSH }
+            }
             steps {
-                withCredentials([usernamePassword(credentialsId: 'dockerhub',
-                                                  usernameVariable: 'DH_USER',
-                                                  passwordVariable: 'DH_TOKEN')]) {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub',
+                    usernameVariable: 'DH_USER',
+                    passwordVariable: 'DH_TOKEN'
+                )]) {
                     sh '''
                         echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
                         docker push $IMAGE:$VERSION
                         docker push $IMAGE:latest
+                        docker logout
                     '''
                 }
+            }
+        }
+
+        stage('Déploiement staging') {
+            when {
+                expression { params.PUSH }
+            }
+            steps {
+                withCredentials([string(
+                    credentialsId: 'staging-redis-password',
+                    variable: 'REDIS_PASSWORD'
+                )]) {
+                    sh '''
+                        IMAGE_REF="$IMAGE:$VERSION" \
+                        APP_ENV=staging \
+                        PORT=8082 \
+                        REDIS_PASSWORD="$REDIS_PASSWORD" \
+                        docker compose -p legeni-staging \
+                            -f deploy/docker-compose.deploy.yml \
+                            up -d --wait
+
+                        echo "Déploiement staging terminé."
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke test staging') {
+            when {
+                expression { params.PUSH }
+            }
+            steps {
+                sh '''
+                    bash deploy/smoke-test.sh legeni-staging "$VERSION"
+                '''
             }
         }
     }
 
     post {
         always {
-            sh 'docker rm -f $TEST_CONTAINER || true; docker network rm $CI_NETWORK || true'
+            sh '''
+                docker rm -f "$TEST_CONTAINER" || true
+                docker network rm "$CI_NETWORK" || true
+            '''
         }
         success {
-            echo "Image ${IMAGE}:${VERSION} construite et validée"
+            echo "Pipeline réussi : ${IMAGE}:${VERSION}"
         }
         failure {
-            echo "Échec du pipeline : consultez la console de l'étape en rouge"
+            echo "Échec du pipeline : consultez la console de l'étape en rouge."
         }
     }
 }
